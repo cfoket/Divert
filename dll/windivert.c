@@ -901,6 +901,14 @@ static void WinDivertFilterDump(windivert_ioctl_filter_t filter, UINT16 len)
             case WINDIVERT_FILTER_FIELD_TCP_PAYLOADLENGTH:
                 printf("tcp.PayloadLength " );
                 break;
+            case WINDIVERT_FILTER_FIELD_TCP_PAYLOAD:
+                printf("tcp.Payload[%d", filter[i].arg[1]);
+                if (filter[i].arg[2] != filter[i].arg[1])
+                {
+                    printf(":%d", filter[i].arg[2]);
+                }
+                printf("] ");
+                break;
             case WINDIVERT_FILTER_FIELD_UDP_SRCPORT:
                 printf("udp.SrcPort ");
                 break;
@@ -915,6 +923,14 @@ static void WinDivertFilterDump(windivert_ioctl_filter_t filter, UINT16 len)
                 break;
             case WINDIVERT_FILTER_FIELD_UDP_PAYLOADLENGTH:
                 printf("udp.PayloadLength ");
+                break;
+            case WINDIVERT_FILTER_FIELD_UDP_PAYLOAD:
+                printf("udp.Payload[%d", filter[i].arg[1]);
+                if (filter[i].arg[2] != filter[i].arg[1])
+                {
+                    printf(":%d", filter[i].arg[2]);
+                }
+                printf("] ");
                 break;
             default:
                 printf("unknown.Field ");       

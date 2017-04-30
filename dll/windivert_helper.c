@@ -77,6 +77,7 @@ typedef enum
     TOKEN_TCP_DST_PORT,
     TOKEN_TCP_FIN,
     TOKEN_TCP_HDR_LENGTH,
+    TOKEN_TCP_PAYLOAD,
     TOKEN_TCP_PAYLOAD_LENGTH,
     TOKEN_TCP_PSH,
     TOKEN_TCP_RST,
@@ -90,6 +91,7 @@ typedef enum
     TOKEN_UDP_CHECKSUM,
     TOKEN_UDP_DST_PORT,
     TOKEN_UDP_LENGTH,
+    TOKEN_UDP_PAYLOAD,
     TOKEN_UDP_PAYLOAD_LENGTH,
     TOKEN_UDP_SRC_PORT,
     TOKEN_TRUE,
@@ -100,6 +102,8 @@ typedef enum
     TOKEN_SUB_IF_IDX,
     TOKEN_OPEN,
     TOKEN_CLOSE,
+    TOKEN_OPEN_SQUARE,
+    TOKEN_CLOSE_SQUARE,
     TOKEN_EQ,
     TOKEN_NEQ,
     TOKEN_LT,
@@ -161,6 +165,7 @@ typedef UINT64 ERROR;
 #define WINDIVERT_ERROR_UNEXPECTED_TOKEN        6
 #define WINDIVERT_ERROR_OUTPUT_TOO_SHORT        7
 #define WINDIVERT_ERROR_ASSERTION_FAILED        8
+#define WINDIVERT_ERROR_INVALID_RANGE           9
 
 #define MAKE_ERROR(code, pos)                   \
     (((ERROR)(code) << 32) | (ERROR)(pos));
@@ -835,6 +840,7 @@ static ERROR WinDivertTokenizeFilter(const char *filter, WINDIVERT_LAYER layer,
         {"tcp.DstPort",         TOKEN_TCP_DST_PORT},
         {"tcp.Fin",             TOKEN_TCP_FIN},
         {"tcp.HdrLength",       TOKEN_TCP_HDR_LENGTH},
+        {"tcp.Payload",         TOKEN_TCP_PAYLOAD},
         {"tcp.PayloadLength",   TOKEN_TCP_PAYLOAD_LENGTH},
         {"tcp.Psh",             TOKEN_TCP_PSH},
         {"tcp.Rst",             TOKEN_TCP_RST},
@@ -849,6 +855,7 @@ static ERROR WinDivertTokenizeFilter(const char *filter, WINDIVERT_LAYER layer,
         {"udp.Checksum",        TOKEN_UDP_CHECKSUM},
         {"udp.DstPort",         TOKEN_UDP_DST_PORT},
         {"udp.Length",          TOKEN_UDP_LENGTH},
+        {"udp.Payload",         TOKEN_UDP_PAYLOAD},
         {"udp.PayloadLength",   TOKEN_UDP_PAYLOAD_LENGTH},
         {"udp.SrcPort",         TOKEN_UDP_SRC_PORT},
     };
@@ -945,6 +952,12 @@ static ERROR WinDivertTokenizeFilter(const char *filter, WINDIVERT_LAYER layer,
                     return MAKE_ERROR(WINDIVERT_ERROR_BAD_TOKEN, i-1);
                 }
                 tokens[tp++].kind = TOKEN_OR;
+                continue;
+            case '[':
+                tokens[tp++].kind = TOKEN_OPEN_SQUARE;
+                continue;
+            case ']':
+                tokens[tp++].kind = TOKEN_CLOSE_SQUARE;
                 continue;
             default:
                 break;
@@ -1200,6 +1213,14 @@ static PEXPR WinDivertMakeBinOp(PPOOL pool, KIND kind, PEXPR arg0, PEXPR arg1)
     {
         return NULL;
     }
+    // Do not allow big numbers in comparisons with payloads.
+    if (arg1->kind == TOKEN_NUMBER &&
+        (arg1->val[1] != 0 || arg1->val[2] != 0 || arg1->val[3] != 0) &&
+        (arg0->kind == TOKEN_TCP_PAYLOAD || arg0->kind == TOKEN_UDP_PAYLOAD))
+    {
+        pool->error = MAKE_ERROR(WINDIVERT_ERROR_UNEXPECTED_TOKEN, 0);
+        return NULL;
+    }
     expr = (PEXPR)WinDivertAlloc(pool, sizeof(EXPR));
     if (expr == NULL)
     {
@@ -1228,6 +1249,24 @@ static PEXPR WinDivertMakeIfThenElse(PPOOL pool, PEXPR cond, PEXPR th,
     expr->arg[0] = cond;
     expr->arg[1] = th;
     expr->arg[2] = el;
+    return expr;
+}
+
+/*
+ * Construct an array range.
+ */
+static PEXPR WinDivertMakeArrayRange(PPOOL pool, UINT8 kind, UINT32 start,
+    UINT32 stop)
+{
+    PEXPR expr = (PEXPR)WinDivertAlloc(pool, sizeof(EXPR));
+    if (expr == NULL)
+    {
+        return NULL;
+    }
+    memset(expr, 0, sizeof(EXPR));
+    expr->kind = kind;
+    expr->val[0] = start;
+    expr->val[1] = stop;
     return expr;
 }
 
@@ -1305,14 +1344,50 @@ static PEXPR WinDivertParseTest(PPOOL pool, TOKEN *toks, UINT *i)
         case TOKEN_UDP_LENGTH:
         case TOKEN_UDP_CHECKSUM:
         case TOKEN_UDP_PAYLOAD_LENGTH:
+            var = WinDivertMakeVar(pool, toks[*i].kind);
+            *i = *i + 1;
             break;
+        case TOKEN_TCP_PAYLOAD:
+        case TOKEN_UDP_PAYLOAD:
+            kind = toks[*i].kind;
+            *i = *i + 1;
+            if (toks[*i].kind == TOKEN_OPEN_SQUARE)
+            {
+                *i = *i + 1;
+                if (toks[*i].kind == TOKEN_NUMBER)
+                {
+                    UINT32 start = toks[*i].val[0];
+                    UINT32 stop = start;
+                    *i = *i + 1;
+                    if (toks[*i].kind == TOKEN_COLON)
+                    {
+                        *i = *i + 1;
+                        if (toks[*i].kind == TOKEN_NUMBER)
+                        {
+                            stop = toks[*i].val[0];
+                            *i = *i + 1;
+                        }
+                    }
+                    if (toks[*i].kind == TOKEN_CLOSE_SQUARE)
+                    {
+                        if (start > stop || stop - start > 4)
+                        {
+                            pool->error = MAKE_ERROR(
+                                WINDIVERT_ERROR_INVALID_RANGE, toks[*i].pos);
+                            return NULL;
+                        }
+
+                        var = WinDivertMakeArrayRange(pool, kind, start, stop);
+                        *i = *i + 1;
+                        break;
+                    }
+                }
+            }
         default:
             pool->error = MAKE_ERROR(WINDIVERT_ERROR_UNEXPECTED_TOKEN,
                 toks[*i].pos);
             return NULL;
     }
-    var = WinDivertMakeVar(pool, toks[*i].kind);
-    *i = *i + 1;
     switch (toks[*i].kind)
     {
         case TOKEN_EQ:
@@ -1545,6 +1620,10 @@ static BOOL WinDivertEvalTest(PEXPR test, BOOL *res)
         case TOKEN_IPV6_SRC_ADDR:
         case TOKEN_IPV6_DST_ADDR:
             return FALSE;
+        case TOKEN_TCP_PAYLOAD:
+        case TOKEN_UDP_PAYLOAD:
+            *res = var->val[1] <= 0xFFFF;
+            return !*res;
         default:
             lb = 0; ub = 0xFFFFFFFF;
     }
@@ -1863,6 +1942,9 @@ static void WinDivertEmitTest(PEXPR test, UINT16 offset,
         case TOKEN_TCP_PAYLOAD_LENGTH:
             object->field = WINDIVERT_FILTER_FIELD_TCP_PAYLOADLENGTH;
             break;
+        case TOKEN_TCP_PAYLOAD:
+            object->field = WINDIVERT_FILTER_FIELD_TCP_PAYLOAD;
+            break;
         case TOKEN_UDP_SRC_PORT:
             object->field = WINDIVERT_FILTER_FIELD_UDP_SRCPORT;
             break;
@@ -1878,13 +1960,25 @@ static void WinDivertEmitTest(PEXPR test, UINT16 offset,
         case TOKEN_UDP_PAYLOAD_LENGTH:
             object->field = WINDIVERT_FILTER_FIELD_UDP_PAYLOADLENGTH;
             break;
+        case TOKEN_UDP_PAYLOAD:
+            object->field = WINDIVERT_FILTER_FIELD_UDP_PAYLOAD;
+            break;
         default:
             return;
     }
-    object->arg[0] = val->val[0];
-    object->arg[1] = val->val[1];
-    object->arg[2] = val->val[2];
-    object->arg[3] = val->val[3];
+    if (var->kind == TOKEN_TCP_PAYLOAD || var->kind == TOKEN_UDP_PAYLOAD)
+    {
+        object->arg[0] = val->val[0];
+        object->arg[1] = var->val[0];
+        object->arg[2] = var->val[1];
+    }
+    else
+    {
+        object->arg[0] = val->val[0];
+        object->arg[1] = val->val[1];
+        object->arg[2] = val->val[2];
+        object->arg[3] = val->val[3];
+    }
     switch (test->succ)
     {
         case WINDIVERT_FILTER_RESULT_ACCEPT:
@@ -2030,6 +2124,8 @@ static const char *WinDivertErrorString(UINT code)
             return "Filter object buffer is too short";
         case WINDIVERT_ERROR_ASSERTION_FAILED:
             return "Internal assertion failed";
+        case WINDIVERT_ERROR_INVALID_RANGE:
+            return "Filter expression contains an invalid range";
         default:
             return "Unknown error";
     }
@@ -2097,6 +2193,33 @@ static int WinDivertBigNumCompare(const UINT32 *a, const UINT32 *b)
         return 1;
     }
     return 0;
+}
+
+/*
+* Extracts up to four bytes from the given packet's payload.
+*/
+static BOOL WinDivertExtractPayload(UCHAR* payload, size_t payload_length,
+    struct windivert_ioctl_filter_s* filter, UINT32* result)
+{
+    *result = 0;
+
+    UINT32 index1 = filter->arg[1];
+    UINT32 index2 = filter->arg[2];
+
+    if (index2 < payload_length)
+    {
+        UINT32 num_bytes = index2 - index1 + 1;
+
+        for (UINT32 i = 0; i < num_bytes; i++)
+        {
+            *result <<= 8;
+            *result |= payload[index1 + i];
+        }
+
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 /*
@@ -2207,6 +2330,7 @@ extern BOOL WinDivertHelperEvalFilter(const char *filter,
             case WINDIVERT_FILTER_FIELD_TCP_CHECKSUM:
             case WINDIVERT_FILTER_FIELD_TCP_URGPTR:
             case WINDIVERT_FILTER_FIELD_TCP_PAYLOADLENGTH:
+            case WINDIVERT_FILTER_FIELD_TCP_PAYLOAD:
                 pass = (tcphdr != NULL);
                 break;
             case WINDIVERT_FILTER_FIELD_UDP_SRCPORT:
@@ -2214,6 +2338,7 @@ extern BOOL WinDivertHelperEvalFilter(const char *filter,
             case WINDIVERT_FILTER_FIELD_UDP_LENGTH:
             case WINDIVERT_FILTER_FIELD_UDP_CHECKSUM:
             case WINDIVERT_FILTER_FIELD_UDP_PAYLOADLENGTH:
+            case WINDIVERT_FILTER_FIELD_UDP_PAYLOAD:
                 pass = (udphdr != NULL);
                 break;
             default:
@@ -2393,6 +2518,10 @@ extern BOOL WinDivertHelperEvalFilter(const char *filter,
             case WINDIVERT_FILTER_FIELD_TCP_PAYLOADLENGTH:
                 val[0] = payload_len;
                 break;
+            case WINDIVERT_FILTER_FIELD_TCP_PAYLOAD:
+                pass = WinDivertExtractPayload((UCHAR*)packet + packet_len -
+                    payload_len, payload_len, &object[pc], &val[0]);
+                break;
             case WINDIVERT_FILTER_FIELD_UDP_SRCPORT:
                 val[0] = ntohs(udphdr->SrcPort);
                 break;
@@ -2408,34 +2537,50 @@ extern BOOL WinDivertHelperEvalFilter(const char *filter,
             case WINDIVERT_FILTER_FIELD_UDP_PAYLOADLENGTH:
                 val[0] = payload_len;
                 break;
+            case WINDIVERT_FILTER_FIELD_UDP_PAYLOAD:
+                pass = WinDivertExtractPayload((UCHAR*)packet + packet_len -
+                    payload_len, payload_len, &object[pc], &val[0]);
+                break;
             default:
                 SetLastError(ERROR_INVALID_PARAMETER);
                 return FALSE;
         }
-        cmp = WinDivertBigNumCompare(val, object[pc].arg);
-        switch (object[pc].test)
+        if (pass)
         {
-            case WINDIVERT_FILTER_TEST_EQ:
-                pass = (cmp == 0);
-                break;
-            case WINDIVERT_FILTER_TEST_NEQ:
-                pass = (cmp != 0);
-                break;
-            case WINDIVERT_FILTER_TEST_LT:
-                pass = (cmp < 0);
-                break;
-            case WINDIVERT_FILTER_TEST_LEQ:
-                pass = (cmp <= 0);
-                break;
-            case WINDIVERT_FILTER_TEST_GT:
-                pass = (cmp > 0);
-                break;
-            case WINDIVERT_FILTER_TEST_GEQ:
-                pass = (cmp >= 0);
-                break;
-            default:
-                SetLastError(ERROR_INVALID_PARAMETER);
-                return FALSE;
+            if (object[pc].field == WINDIVERT_FILTER_FIELD_TCP_PAYLOAD ||
+                object[pc].field == WINDIVERT_FILTER_FIELD_UDP_PAYLOAD)
+            {
+                cmp = val[0] < object[pc].arg[0] ? -1 :
+                    (val[0] > object[pc].arg[0] ? 1 : 0);
+            }
+            else
+            {
+                cmp = WinDivertBigNumCompare(val, object[pc].arg);
+            }
+            switch (object[pc].test)
+            {
+                case WINDIVERT_FILTER_TEST_EQ:
+                    pass = (cmp == 0);
+                    break;
+                case WINDIVERT_FILTER_TEST_NEQ:
+                    pass = (cmp != 0);
+                    break;
+                case WINDIVERT_FILTER_TEST_LT:
+                    pass = (cmp < 0);
+                    break;
+                case WINDIVERT_FILTER_TEST_LEQ:
+                    pass = (cmp <= 0);
+                    break;
+                case WINDIVERT_FILTER_TEST_GT:
+                    pass = (cmp > 0);
+                    break;
+                case WINDIVERT_FILTER_TEST_GEQ:
+                    pass = (cmp >= 0);
+                    break;
+                default:
+                    SetLastError(ERROR_INVALID_PARAMETER);
+                    return FALSE;
+            }
         }
         pc = (pass? object[pc].success: object[pc].failure);
     }

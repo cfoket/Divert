@@ -2696,6 +2696,44 @@ static int windivert_big_num_compare(const UINT32 *a, const UINT32 *b)
 }
 
 /*
+* Extracts up to four bytes from the given packet's payload.
+*/
+static BOOL windivert_extract_payload(PNET_BUFFER buffer, size_t packet_length,
+    size_t payload_offset, filter_t filter, UINT32* result)
+{
+    size_t payload_length = packet_length - payload_offset;
+    UINT32 start = filter->arg[1];
+    UINT32 stop = filter->arg[2];
+
+    if (stop < payload_length)
+    {
+        UINT32 num_bytes;
+        UCHAR* payload;
+        NTSTATUS status;
+
+        NdisAdvanceNetBufferDataStart(buffer, payload_offset, FALSE, NULL);
+        num_bytes = stop - start + 1;
+        payload = (UCHAR*)NdisGetDataBuffer(buffer, num_bytes, NULL, 1, 0);
+        *result = 0;
+
+        for (UINT32 i = 0; i < num_bytes; i++)
+        {
+            *result <<= 8;
+            *result |= payload[start + i];
+        }
+        status = NdisRetreatNetBufferDataStart(buffer, payload_offset, 0, NULL);
+        if (!NT_SUCCESS(status))
+        {
+            // Should never occur.
+            DEBUG("EXTRACT_PAYLOAD: failed to retreat buffer (%d)", status);
+            return FALSE;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/*
  * Checks if the given packet is of interest.
  */
 static BOOL windivert_filter(PNET_BUFFER buffer, UINT32 if_idx,
@@ -3089,6 +3127,11 @@ static BOOL windivert_filter(PNET_BUFFER buffer, UINT32 if_idx,
                     field[0] = (UINT32)(tot_len - ip_header_len -
                         tcp_header->HdrLength*sizeof(UINT32));
                     break;
+                case WINDIVERT_FILTER_FIELD_TCP_PAYLOAD:
+                    result = windivert_extract_payload(buffer, tot_len,
+                        ip_header_len + tcp_header->HdrLength*sizeof(UINT32),
+                        &filter[ip], &field[0]);
+                    break;
                 case WINDIVERT_FILTER_FIELD_UDP_SRCPORT:
                     field[0] = (UINT32)RtlUshortByteSwap(udp_header->SrcPort);
                     break;
@@ -3113,34 +3156,51 @@ static BOOL windivert_filter(PNET_BUFFER buffer, UINT32 if_idx,
                     field[0] = (UINT32)(tot_len - ip_header_len -
                         sizeof(struct udphdr));
                     break;
+                case WINDIVERT_FILTER_FIELD_UDP_PAYLOAD:
+                    result = windivert_extract_payload(buffer, tot_len,
+                        ip_header_len + sizeof(struct udphdr), &filter[ip],
+                        &field[0]);
+                    break;
                 default:
                     field[0] = 0;
                     break;
             }
-            cmp = windivert_big_num_compare(field, filter[ip].arg);
-            switch (filter[ip].test)
+            if (result)
             {
-                case WINDIVERT_FILTER_TEST_EQ:
-                    result = (cmp == 0);
-                    break;
-                case WINDIVERT_FILTER_TEST_NEQ:
-                    result = (cmp != 0);
-                    break;
-                case WINDIVERT_FILTER_TEST_LT:
-                    result = (cmp < 0);
-                    break;
-                case WINDIVERT_FILTER_TEST_LEQ:
-                    result = (cmp <= 0);
-                    break;
-                case WINDIVERT_FILTER_TEST_GT:
-                    result = (cmp > 0);
-                    break;
-                case WINDIVERT_FILTER_TEST_GEQ:
-                    result = (cmp >= 0);
-                    break;
-                default:
-                    result = FALSE;
-                    break;
+                if (filter[ip].field == WINDIVERT_FILTER_FIELD_TCP_PAYLOAD ||
+                    filter[ip].field == WINDIVERT_FILTER_FIELD_UDP_PAYLOAD)
+                {
+                    cmp = field[0] < filter[ip].arg[0] ? -1 :
+                        (field[0] > filter[ip].arg[0] ? 1 : 0);
+                }
+                else
+                {
+                    cmp = windivert_big_num_compare(field, filter[ip].arg);
+                }
+                switch (filter[ip].test)
+                {
+                    case WINDIVERT_FILTER_TEST_EQ:
+                        result = (cmp == 0);
+                        break;
+                    case WINDIVERT_FILTER_TEST_NEQ:
+                        result = (cmp != 0);
+                        break;
+                    case WINDIVERT_FILTER_TEST_LT:
+                        result = (cmp < 0);
+                        break;
+                    case WINDIVERT_FILTER_TEST_LEQ:
+                        result = (cmp <= 0);
+                        break;
+                    case WINDIVERT_FILTER_TEST_GT:
+                        result = (cmp > 0);
+                        break;
+                    case WINDIVERT_FILTER_TEST_GEQ:
+                        result = (cmp >= 0);
+                        break;
+                    default:
+                        result = FALSE;
+                        break;
+                }
             }
         }
         ip = (result? filter[ip].success: filter[ip].failure);
@@ -3353,7 +3413,9 @@ static filter_t windivert_filter_compile(windivert_ioctl_filter_t ioctl_filter,
 
         // Enforce size limits:
         if (ioctl_filter[i].field != WINDIVERT_FILTER_FIELD_IPV6_SRCADDR &&
-            ioctl_filter[i].field != WINDIVERT_FILTER_FIELD_IPV6_DSTADDR)
+            ioctl_filter[i].field != WINDIVERT_FILTER_FIELD_IPV6_DSTADDR &&
+            ioctl_filter[i].field != WINDIVERT_FILTER_FIELD_TCP_PAYLOAD &&
+            ioctl_filter[i].field != WINDIVERT_FILTER_FIELD_UDP_PAYLOAD)
         {
             if (ioctl_filter[i].arg[1] != 0 ||
                 ioctl_filter[i].arg[2] != 0 ||
@@ -3442,6 +3504,14 @@ static filter_t windivert_filter_compile(windivert_ioctl_filter_t ioctl_filter,
                     goto windivert_filter_compile_exit;
                 }
                 break;
+            case WINDIVERT_FILTER_FIELD_TCP_PAYLOAD:
+            case WINDIVERT_FILTER_FIELD_UDP_PAYLOAD:
+                if (ioctl_filter[i].arg[2] > UINT16_MAX ||
+                    ioctl_filter[i].arg[1] > ioctl_filter[i].arg[2] ||
+                    ioctl_filter[i].arg[2] - ioctl_filter[i].arg[1] > 4)
+                {
+                    goto windivert_filter_compile_exit;
+                }
             default:
                 break;
         }
@@ -3520,6 +3590,7 @@ static filter_t windivert_filter_compile(windivert_ioctl_filter_t ioctl_filter,
             case WINDIVERT_FILTER_FIELD_TCP_CHECKSUM:
             case WINDIVERT_FILTER_FIELD_TCP_URGPTR:
             case WINDIVERT_FILTER_FIELD_TCP_PAYLOADLENGTH:
+            case WINDIVERT_FILTER_FIELD_TCP_PAYLOAD:
                 filter0[i].protocol = WINDIVERT_FILTER_PROTOCOL_TCP;
                 break;
             case WINDIVERT_FILTER_FIELD_UDP_SRCPORT:
@@ -3527,6 +3598,7 @@ static filter_t windivert_filter_compile(windivert_ioctl_filter_t ioctl_filter,
             case WINDIVERT_FILTER_FIELD_UDP_LENGTH:
             case WINDIVERT_FILTER_FIELD_UDP_CHECKSUM:
             case WINDIVERT_FILTER_FIELD_UDP_PAYLOADLENGTH:
+            case WINDIVERT_FILTER_FIELD_UDP_PAYLOAD:
                 filter0[i].protocol = WINDIVERT_FILTER_PROTOCOL_UDP;
                 break;
             default:
